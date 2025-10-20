@@ -143,9 +143,12 @@
 #define LONGOPT_PRINT_TIMERS            LONGOPT_BASE_APPLICATION+9
 #define LONGOPT_GLOBAL_PROFILE          LONGOPT_BASE_APPLICATION+10
 #define LONGOPT_COMPRESS                LONGOPT_BASE_APPLICATION+11
+#define LONGOPT_EXPORT_RSN_CSV         LONGOPT_BASE_APPLICATION+12
+
 
 capture_file cfile;
 
+extern bool export_rsn_csv;
 static uint32_t cum_bytes;
 static frame_data ref_frame;
 static frame_data prev_dis_frame;
@@ -1063,6 +1066,7 @@ main(int argc, char *argv[])
         {"print-timers", ws_no_argument, NULL, LONGOPT_PRINT_TIMERS},
         {"global-profile", ws_no_argument, NULL, LONGOPT_GLOBAL_PROFILE},
         {"compress", ws_required_argument, NULL, LONGOPT_COMPRESS},
+        { "export-rsn-csv", ws_no_argument, NULL, LONGOPT_EXPORT_RSN_CSV },
         {0, 0, 0, 0}
     };
     bool                 arg_error = false;
@@ -1418,6 +1422,9 @@ main(int argc, char *argv[])
     /* Now get our args */
     while ((opt = ws_getopt_long(argc, argv, optstring, long_options, NULL)) != -1) {
         switch (opt) {
+            case LONGOPT_EXPORT_RSN_CSV:
+                export_rsn_csv = true;
+                break;
             case '2':        /* Perform two-pass analysis */
                 if(epan_auto_reset){
                     cmdarg_err("-2 does not support auto session reset.");

@@ -93,6 +93,8 @@ typedef struct {
   uint8_t *keydata;
 } proto_keydata_t;
 
+bool export_rsn_csv __attribute__((visibility("default")))= false; // use in tshark.c
+
 extern value_string_ext eap_type_vals_ext; /* from packet-eap.c */
 
 /* TUs are used a lot in 802.11 ... */
@@ -367,6 +369,8 @@ typedef enum {
   PASN_DATA_KEY,
   HE_CHANNEL_WIDTH_KEY,
   FRAME_TYPE_KEY,
+  WLAN_STATS_SSID,
+  WLAN_STATS_CHANNEL
 } wlan_proto_key_t;
 
 /* ************************************************************************* */
@@ -22528,6 +22532,33 @@ dissect_rsn_ie(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
   proto_tree_add_bitmask_with_flags(tree, tvb, offset, hf_ieee80211_rsn_cap,
                                     ett_rsn_cap_tree, ieee80211_rsn_cap,
                                     ENC_LITTLE_ENDIAN, BMT_NO_APPEND);
+  
+  // exporting csv rsn
+  uint32_t ftype = GPOINTER_TO_UINT(p_get_proto_data(wmem_file_scope(),
+                                                     pinfo, proto_wlan,
+                                                     FRAME_TYPE_KEY));
+
+  if (export_rsn_csv && (ftype == MGT_BEACON || ftype == MGT_PROBE_RESP)) {
+      static bool header_printed = FALSE;
+      if (!header_printed) {
+          printf("BSSID,SSID,Channel,PairwiseCiphers,GroupCipher,AKM,MFPC,MFPR\n");
+          header_printed = TRUE;
+      }
+      const char *bssid_str=address_to_str(pinfo->pool,&(pinfo->dl_src)); // src is bssid in beacons and probe resp.;
+      uint8_t channel = GPOINTER_TO_UINT(p_get_proto_data(wmem_file_scope(), pinfo, proto_wlan, WLAN_STATS_CHANNEL));;
+      const char *ssid_str=p_get_proto_data(wmem_file_scope(), pinfo, proto_wlan, WLAN_STATS_SSID);
+      const char *pairwise_cipher = ieee80211_rsn_cipher_vals[GPOINTER_TO_UINT(p_get_proto_data(pinfo->pool, pinfo, proto_wlan, CIPHER_KEY))].strptr;
+      const char *grp_cipher = ieee80211_rsn_cipher_vals[GPOINTER_TO_UINT(p_get_proto_data(pinfo->pool, pinfo, proto_wlan, GROUP_CIPHER_KEY))].strptr;
+      const char *akm_cipher = ieee80211_rsn_keymgmt_vals[GPOINTER_TO_UINT(p_get_proto_data(pinfo->pool, pinfo, proto_wlan, AKM_KEY))].strptr;
+      // int mfpc = *ieee80211_rsn_cap[5];
+      // int mfpr = *ieee80211_rsn_cap[4];
+
+      // verify later
+      int mfpc = hf_ieee80211_rsn_cap &(1<<7);
+      int mfpr = hf_ieee80211_rsn_cap &(1<<6);
+      printf("%s,%s,%d,%s,%s,%s,%d,%d\n",bssid_str, ssid_str, channel,pairwise_cipher,grp_cipher,akm_cipher,mfpc,mfpr);
+
+  }
   offset += 2;
   if (offset >= tag_end)
   {
@@ -30528,9 +30559,13 @@ ieee80211_tag_ssid(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* da
     col_append_str(pinfo->cinfo, COL_INFO, ", SSID=Wildcard (Broadcast)");
     offset += 1; // Make sure we return non-zero
   }
-
+  
   beacon_padding += 1; /* padding bug */
-
+  if(export_rsn_csv)
+  {
+    p_add_proto_data(wmem_file_scope(), pinfo, proto_wlan, WLAN_STATS_SSID, wlan_stats.ssid);
+    // printf(" added here ssid key\n");
+  }
   return offset + tag_len;
 }
 
@@ -30784,7 +30819,11 @@ ieee80211_tag_ds_parameter(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, 
 
   wlan_stats.channel = tvb_get_uint8(tvb, offset);
   offset += 1;
-
+  if(export_rsn_csv)
+  {
+    p_add_proto_data(wmem_file_scope(), pinfo, proto_wlan, WLAN_STATS_CHANNEL,GINT_TO_POINTER(wlan_stats.channel)); // passsing the value as a pointer (pointer corresponds to actual value and not address)
+    // printf("added here channel key \n");
+  }
   return offset;
 }
 
