@@ -28,6 +28,71 @@
 void proto_register_eap(void);
 void proto_reg_handoff_eap(void);
 
+#include <stdio.h>
+#include <string.h>
+#include <glib.h>
+
+static void
+anonymize_identity_fn(const uint8_t* identity, size_t length)
+{
+    // FNV-1a 64-bit hash constants
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    uint64_t fnv_prime = 0x100000001b3ULL;
+
+    for (size_t i = 0; i < length; i++) {
+        hash ^= identity[i];
+        hash *= fnv_prime;
+    }
+
+    static FILE *map_file = NULL;
+    static GMutex file_lock;
+
+    g_mutex_lock(&file_lock);
+
+    if (!map_file) {
+        printf("Writing identity mappings to identity_mapping.txt\n");
+        fflush(stdout);
+        map_file = fopen("identity_mapping.txt", "w");
+        if (!map_file) {
+            g_mutex_unlock(&file_lock);
+            fprintf(stderr, "Can't open identity_mapping.txt\n");
+                for (size_t i = 0; i < length; i++) {
+                    ((uint8_t*)identity)[i] = ((((uint8_t*)&hash)[i % sizeof(hash)])%26+65);
+                }
+            return;
+        }
+    }
+    for (size_t i = 0; i < length; i++) {
+      // print LHS
+      fprintf(map_file, "%c", identity[i]);
+        ((uint8_t*)identity)[i] = ((((uint8_t*)&hash)[i % sizeof(hash)])%26+65);
+      }
+      fprintf(map_file, " -> ");
+      // print RHS
+      for (size_t i = 0; i < length; i++)
+      fprintf(map_file, "%c", identity[i]);
+
+    fprintf(map_file, "\n");
+    fflush(map_file);
+    g_mutex_unlock(&file_lock);
+}
+
+
+static proto_item* add_anonymous_identity(proto_tree *hdr_tree,int hf,tvbuff_t *tvb,   int offset, int len)
+{
+  // did malloc coz stack allocation of size 2^16 not permitted
+  uint8_t *identity = malloc(len+1);
+  tvb_memcpy(tvb, identity, offset, len);
+  // uint8_t new_identity[65536];
+  anonymize_identity_fn(identity, len);
+  identity[len] = '\0';
+  // proto_tree_add_ether(hdr_tree, hf, tvb, offset, len, new_identity);
+  // proto_tree_add_item(hdr_tree, hf, tvb, offset, len, ENC_ASCII);
+  return proto_tree_add_string(hdr_tree, hf, tvb, offset, len, identity);
+  free(identity);
+}
+bool anonymize_identity __attribute__((visibility("default")))= false; // use in tshark.c
+
 static int proto_eap;
 static int hf_eap_code;
 static int hf_eap_identifier;
@@ -983,13 +1048,19 @@ dissect_eap_identity_3gpp(tvbuff_t *tvb, packet_info* pinfo, proto_tree* tree, i
 
     /* We have already checked above that the identity was valid ASCII so
      * offsets in the tokens are the same as in the TVB. */
-    proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset, (int)strlen(tokens[0]), ENC_ASCII);
-    offset += (int)(strlen(tokens[0]) + 1 + strlen("CertificateSerialNumber="));
-    const char* cert = tokens[1] + strlen("CertificateSerialNumber=");
+    if(anonymize_identity)
+    {
+      add_anonymous_identity(eap_identity_tree, hf_eap_identity, tvb, offset, (int)strlen(tokens[0]));
+    }
+    else
+      {proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset, (int)strlen(tokens[0]), ENC_ASCII);}
 
-    /* Add Certificate Serial Number to the tree */
-    proto_tree_add_item(eap_identity_tree, hf_eap_identity_certificate_sn, tvb,
-      offset, (int)strlen(cert), ENC_ASCII);
+      offset += (int)(strlen(tokens[0]) + 1 + strlen("CertificateSerialNumber="));
+      const char* cert = tokens[1] + strlen("CertificateSerialNumber=");
+
+      /* Add Certificate Serial Number to the tree */
+      proto_tree_add_item(eap_identity_tree, hf_eap_identity_certificate_sn, tvb,
+        offset, (int)strlen(cert), ENC_ASCII);
 
     /* Check for the optional NAI Realm string */
     if (ntokens != 3 || g_ascii_strncasecmp(tokens[2], "Realm=", 6)) {
@@ -1066,29 +1137,59 @@ dissect_eap_identity_3gpp(tvbuff_t *tvb, packet_info* pinfo, proto_tree* tree, i
         case '2': /* EAP-AKA Pseudonym */
         case '3': /* EAP-SIM Pseudonym */
         case '7': /* EAP-AKA' Pseudonym */
-          proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset + 1, (unsigned)strlen(tokens[0]) - 1, ENC_ASCII);
+        if (anonymize_identity)
+        {
+          add_anonymous_identity(eap_identity_tree, hf_eap_identity, tvb, offset + 1, (unsigned)strlen(tokens[0]) - 1);
+        }
+        else
+          {proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset + 1, (unsigned)strlen(tokens[0]) - 1, ENC_ASCII);}
           break;
         case '4': /* EAP-AKA Reauth ID */
         case '5': /* EAP-SIM Reauth ID */
         case '8': /* EAP-AKA' Reauth ID */
-          proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset + 1, (unsigned)strlen(tokens[0]) - 1, ENC_ASCII);
+        if (anonymize_identity)
+        {
+          add_anonymous_identity(eap_identity_tree, hf_eap_identity, tvb, offset + 1, (unsigned)strlen(tokens[0]) - 1);
+        }
+        else
+          {proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset + 1, (unsigned)strlen(tokens[0]) - 1, ENC_ASCII);}
           break;
         case 'C': /* Conservative Peer */
-          proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset + 1, (unsigned)strlen(tokens[0]) - 1, ENC_ASCII);
+        if (anonymize_identity)
+        {
+          add_anonymous_identity(eap_identity_tree, hf_eap_identity, tvb, offset + 1, (unsigned)strlen(tokens[0]) - 1);
+        }
+        else
+          {proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset + 1, (unsigned)strlen(tokens[0]) - 1, ENC_ASCII);}
           break;
         case 'a': /* Anonymous User */
           /* This is not really a prefix, just a username "anonymous" */
-          proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset, (unsigned)strlen(tokens[0]), ENC_ASCII);
+        if (anonymize_identity)
+        {
+          add_anonymous_identity(eap_identity_tree, hf_eap_identity, tvb, offset, (unsigned)strlen(tokens[0]));
+        }
+        else
+          {proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset, (unsigned)strlen(tokens[0]), ENC_ASCII);}
           break;
         case 'G': /* TODO: 'G' Unknown */
         case 'I': /* TODO: 'I' Unknown */
         default:
-          proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset + 1, (unsigned)strlen(tokens[0]) - 1, ENC_ASCII);
+          if (anonymize_identity)
+          {
+            add_anonymous_identity(eap_identity_tree, hf_eap_identity, tvb, offset + 1, (unsigned)strlen(tokens[0]) - 1);
+          }
+          else
+          {proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset + 1, (unsigned)strlen(tokens[0]) - 1, ENC_ASCII);}
           expert_add_info(pinfo, item, &ei_eap_identity_invalid);
       }
     } else {
       /* It's a 3GPP realm, but probably not using a prefix, e.g. in 5G. */
-      proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset, (int)strlen(tokens[0]), ENC_ASCII);
+      if (anonymize_identity)
+        {
+          add_anonymous_identity(eap_identity_tree, hf_eap_identity, tvb, offset, (unsigned)strlen(tokens[0]));
+        }
+        else
+      {proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset, (int)strlen(tokens[0]), ENC_ASCII);}
     }
   }
 
@@ -1149,8 +1250,14 @@ dissect_eap_identity(tvbuff_t *tvb, packet_info* pinfo, proto_tree* tree, int of
    *
    * XXX - what other types of identity are there?
    */
+  // if(!eap_identity_map)
+  // {
+  //   eap_identity_map = g_hash_table_new_full(g_int_hash, g_int_equal);
+
+  // }
   if (!dissect_eap_identity_3gpp(tvb, pinfo, tree, offset, size)) {
-    item = proto_tree_add_item(tree, hf_eap_identity, tvb, offset, size, ENC_ASCII);
+
+    item = anonymize_identity?add_anonymous_identity(tree, hf_eap_identity, tvb, offset, size):proto_tree_add_item(tree, hf_eap_identity, tvb, offset, size, ENC_ASCII);
     /* XXX - RFC 7542 revises earlier standards by allowing UTF-8 in the
      * NAI (username and realm); if this happens in EAP, remove the expert info. */
     if (tvb_ascii_isprint(tvb, offset, size) == false) {

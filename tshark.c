@@ -150,6 +150,7 @@ capture_file cfile;
 
 extern bool export_rsn_csv;
 extern bool anonymize_captures;
+extern bool anonymize_identity;
 static uint32_t cum_bytes;
 static frame_data ref_frame;
 static frame_data prev_dis_frame;
@@ -1429,6 +1430,7 @@ main(int argc, char *argv[])
                 break;
             case LONGOPT_ANONYMIZE:
                 anonymize_captures = true;
+                anonymize_identity = true;
                 break;
             case '2':        /* Perform two-pass analysis */
                 if(epan_auto_reset){
