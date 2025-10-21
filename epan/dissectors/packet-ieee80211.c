@@ -94,6 +94,7 @@ typedef struct {
 } proto_keydata_t;
 
 bool export_rsn_csv __attribute__((visibility("default")))= false; // use in tshark.c
+bool anonymize_captures __attribute__((visibility("default")))= false; // use in tshark.c
 
 extern value_string_ext eap_type_vals_ext; /* from packet-eap.c */
 
@@ -1584,6 +1585,55 @@ static value_string_ext aruba_mgt_typevals_ext = VALUE_STRING_EXT_INIT(aruba_mgt
 #define ANQP_INFO_NETWORK_AUTH_TYPE_TIMESTAMP    280
 #define ANQP_INFO_ANQP_VENDOR_SPECIFIC_LIST    56797
 
+static void
+anonymize_mac(const uint8_t* original_mac, uint8_t* anonymized_mac)
+{
+    // FNV-1a 64-bit hash constants
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    uint64_t fnv_prime = 0x100000001b3ULL;
+    int i;
+    for (i = 0; i < 6; i++) {
+        hash = hash ^ original_mac[i];
+        hash = hash * fnv_prime;
+    }
+    
+    memcpy(anonymized_mac, &hash, 6);
+    static FILE *map_file = NULL;
+    static GMutex file_lock;
+
+    g_mutex_lock(&file_lock);
+    
+    if (!map_file) {
+      printf("Writing MAC Mappings to mac_mapping.txt\n");
+      fflush(stdout);
+        map_file = fopen("mac_mapping.txt", "w");
+        if (!map_file) {
+            g_mutex_unlock(&file_lock);
+            printf("Can't open mac_mapping.txt\n");
+            return; // Fail silently if file can't be opened
+        }
+    }
+
+    fprintf(map_file,
+            "%02X:%02X:%02X:%02X:%02X:%02X -> %02X:%02X:%02X:%02X:%02X:%02X\n",
+            original_mac[0], original_mac[1], original_mac[2],
+            original_mac[3], original_mac[4], original_mac[5],
+            anonymized_mac[0], anonymized_mac[1], anonymized_mac[2],
+            anonymized_mac[3], anonymized_mac[4], anonymized_mac[5]);
+
+    fflush(map_file);
+    g_mutex_unlock(&file_lock);
+
+}
+
+static void add_anonymous_mac(proto_tree *hdr_tree,int hf,tvbuff_t *tvb,   int offset)
+{
+  uint8_t original_mac_addr[6];
+  tvb_memcpy(tvb, original_mac_addr, offset, 6);
+  uint8_t new_mac_addr[6];
+  anonymize_mac(original_mac_addr, new_mac_addr);
+  proto_tree_add_ether(hdr_tree, hf, tvb, offset, 6, new_mac_addr);
+}
 /* ANQP information ID - IEEE Std 802.11u-2011 - Table 7-43bk */
 static const value_string anqp_info_id_vals[] = {
   {ANQP_INFO_ANQP_QUERY_LIST, "ANQP Query list"},
@@ -38004,7 +38054,12 @@ static void
 dissect_ieee80211_block_ack(tvbuff_t *tvb, packet_info *pinfo _U_,
   proto_tree *tree, int offset, bool isDMG, bool is_req, bool has_fcs)
 {
-  proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, tree, offset);
+  if(anonymize_captures)
+  {
+    add_anonymous_mac(tree,hf_ieee80211_addr_ta, tvb, offset);
+  }
+  else
+  {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, tree, offset);}
   offset += 6;
 
   dissect_ieee80211_block_ack_details(tvb, pinfo, tree, offset, isDMG, is_req, has_fcs);
@@ -38774,7 +38829,12 @@ dissect_ieee80211_he_eht_trigger(tvbuff_t *tvb, packet_info *pinfo,
   uint8_t           common_info_b54_55;
   bool              eht_trigger = true;
 
-  proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, tree, offset);
+  if(anonymize_captures)
+  {
+    add_anonymous_mac(tree,hf_ieee80211_addr_ta, tvb, offset);
+  }
+  else
+  {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, tree, offset);}
 
   offset += 6;
   length += 6;
@@ -38878,8 +38938,12 @@ dissect_ieee80211_s1g_tack(tvbuff_t *tvb, packet_info *pinfo _U_,
   proto_tree *tree, int offset, uint16_t flags)
 {
   int             length = 0;
-
-  proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, tree, offset);
+  if(anonymize_captures)
+  {
+    add_anonymous_mac(tree,hf_ieee80211_addr_ta, tvb, offset);
+  }
+  else
+  {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, tree, offset);}
 
   offset += 6;
   length += 6;
@@ -39178,8 +39242,12 @@ dissect_ieee80211_ndp_annc(tvbuff_t *tvb, packet_info *pinfo _U_,
 {
   proto_item      *dialog;
   uint8_t          dialog_token;
-
-  proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, tree, offset);
+  if(anonymize_captures)
+  {
+    add_anonymous_mac(tree,hf_ieee80211_addr_ta, tvb, offset);
+  }
+  else
+  {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, tree, offset);}
   offset += 6;
 
   dialog_token = tvb_get_uint8(tvb, offset);
@@ -39777,7 +39845,13 @@ dissect_ieee80211_pv1(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree,
     offset += 2;
   } else {
     set_dst_addr_cols(pinfo, tvb, offset, wlan_ra_ta_address_type);
-    proto_tree_add_mac48_detail(&mac_ra, &mac_addr, ett_addr, tvb, hdr_tree, offset);
+
+    if(anonymize_captures)
+    {
+      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_ra, tvb, offset);
+    }
+    else
+    {proto_tree_add_mac48_detail(&mac_ra, &mac_addr, ett_addr, tvb, hdr_tree, offset);}
     offset += 6;
   }
 
@@ -39794,7 +39868,12 @@ dissect_ieee80211_pv1(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree,
     offset += 2;
   } else {
     set_src_addr_cols(pinfo, tvb, offset, wlan_ra_ta_address_type);
-    proto_tree_add_mac48_detail(&mac_ta, NULL, ett_addr, tvb, hdr_tree, offset);
+      if(anonymize_captures)
+  {
+    add_anonymous_mac(hdr_tree,hf_ieee80211_addr_ta, tvb, offset);
+  }
+  else
+    {proto_tree_add_mac48_detail(&mac_ta, NULL, ett_addr, tvb, hdr_tree, offset);}
     offset += 6;
   }
 
@@ -39815,13 +39894,23 @@ dissect_ieee80211_pv1(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree,
   /* Now, add A3 and A4 if present */
   if (a3_present) {
     set_dst_addr_cols(pinfo, tvb, offset, wlan_address_type);
-    proto_tree_add_mac48_detail(&mac_da, &mac_addr, ett_addr, tvb, hdr_tree, offset);
+    if(anonymize_captures)
+    {
+      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_da, tvb, offset);
+    }
+    else
+    {proto_tree_add_mac48_detail(&mac_da, &mac_addr, ett_addr, tvb, hdr_tree, offset);}
     offset += 6;
   }
 
   if (a4_present) {
     set_src_addr_cols(pinfo, tvb, offset, wlan_address_type);
-    proto_tree_add_mac48_detail(&mac_sa, &mac_addr, ett_addr, tvb, hdr_tree, offset);
+    if(anonymize_captures)
+    {
+      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_sa, tvb, offset);
+    }
+    else
+    {proto_tree_add_mac48_detail(&mac_sa, &mac_addr, ett_addr, tvb, hdr_tree, offset);}
     offset += 6;
   }
 
@@ -40269,7 +40358,13 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
   seq_number = 0;
 
   /* all frames have address 1 = RA */
-  proto_tree_add_mac48_detail(&mac_ra, &mac_addr, ett_addr, tvb, hdr_tree, 4);
+  if(anonymize_captures)
+    {
+      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_ra, tvb, 4);
+    }
+  else
+    {proto_tree_add_mac48_detail(&mac_ra, &mac_addr, ett_addr, tvb, hdr_tree, 4);
+  }
 
   switch (FCF_FRAME_TYPE (fcf))
   {
@@ -40301,11 +40396,27 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
 
       if (tree)
       {
-        proto_tree_add_mac48_detail(&mac_da, NULL, ett_addr, tvb, hdr_tree, 4);
+          if(anonymize_captures)
+    {
+      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_da, tvb, 4);
+      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_ta, tvb, 10);
+      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_sa, tvb, 10);
+    }
+    else
+        {proto_tree_add_mac48_detail(&mac_da, NULL, ett_addr, tvb, hdr_tree, 4);
         proto_tree_add_mac48_detail(&mac_ta, NULL, ett_addr, tvb, hdr_tree, 10);
-        proto_tree_add_mac48_detail(&mac_sa, NULL, ett_addr, tvb, hdr_tree, 10);
+        proto_tree_add_mac48_detail(&mac_sa, NULL, ett_addr, tvb, hdr_tree, 10);}
         check_s1g_setting(pinfo, tvb, 10);
-        proto_tree_add_mac48_detail(&mac_bssid, NULL, ett_addr, tvb, hdr_tree, 16);
+
+        if(anonymize_captures)
+        {
+          add_anonymous_mac(hdr_tree, hf_ieee80211_addr_bssid, tvb, 16);
+        }
+        else
+        {
+          proto_tree_add_mac48_detail(&mac_bssid, NULL, ett_addr, tvb, hdr_tree, 16);
+
+        }
 
         /* FIXME: With mgmt frames FROM_TO_DS is always 0, perhaps compare address to bssid instead? */
         if ((flags & FROM_TO_DS) == FLAG_FROM_DS) { /* Receiver address */
@@ -40358,7 +40469,12 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
 
       if (ctrl_type_subtype == CTRL_PS_POLL) {
         addr1_type = wlan_bssid_address_type;
-        proto_tree_add_mac48_detail(&mac_bssid, NULL, ett_addr, tvb, hdr_tree, 4);
+        if(anonymize_captures)
+        {
+          add_anonymous_mac(hdr_tree, hf_ieee80211_addr_bssid, tvb, 4);
+        }
+        else
+        {proto_tree_add_mac48_detail(&mac_bssid, NULL, ett_addr, tvb, hdr_tree, 4);}
       }
 
       /* Add address 1 */
@@ -40390,7 +40506,12 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
         case CTRL_CFP_ENDACK:
         {
           set_src_addr_cols(pinfo, tvb, offset, wlan_ra_ta_address_type);
-          proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, hdr_tree, offset);
+          if(anonymize_captures)
+          {
+            add_anonymous_mac(hdr_tree, hf_ieee80211_addr_ta, tvb, offset);
+          }
+          else
+          {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, hdr_tree, offset);}
           offset += 6;
           break;
         }
@@ -40404,9 +40525,19 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
           /* if (tree) */
           {
             if (isDMG) {
-              proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, hdr_tree, offset);
+              if(anonymize_captures)
+          {
+            add_anonymous_mac(hdr_tree, hf_ieee80211_addr_ta, tvb, offset);
+          }
+          else
+              {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, hdr_tree, offset);}
             } else {
-              proto_tree_add_mac48_detail(&mac_bssid, &mac_addr, ett_addr, tvb, hdr_tree, offset);
+              if(anonymize_captures)
+        {
+          add_anonymous_mac(hdr_tree, hf_ieee80211_addr_bssid, tvb, offset);
+        }
+        else
+              {proto_tree_add_mac48_detail(&mac_bssid, &mac_addr, ett_addr, tvb, hdr_tree, offset);}
             }
             offset += 6;
           }
@@ -40432,7 +40563,12 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
         case CTRL_BEAMFORM_RPT_POLL:
         {
           set_src_addr_cols(pinfo, tvb, offset, wlan_ra_ta_address_type);
-          proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, hdr_tree, offset);
+          if(anonymize_captures)
+          {
+            add_anonymous_mac(hdr_tree, hf_ieee80211_addr_ta, tvb, offset);
+          }
+          else
+          {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, hdr_tree, offset);}
           offset += 6;
           proto_tree_add_item(hdr_tree, hf_ieee80211_beamform_feedback_seg_retrans_bitmap, tvb, offset, 1, ENC_NA);
           break;
@@ -40455,7 +40591,12 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
         case CTRL_RTS:
         {
           set_src_addr_cols(pinfo, tvb, offset, wlan_ra_ta_address_type);
-          proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, hdr_tree, offset);
+          if(anonymize_captures)
+          {
+            add_anonymous_mac(hdr_tree, hf_ieee80211_addr_ta, tvb, offset);
+          }
+          else
+          {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, hdr_tree, offset);}
           offset += 6;
           break;
         }
@@ -40646,25 +40787,50 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
           case DATA_ADDR_T2:
           case DATA_ADDR_T3:
           case DATA_ADDR_T4:
-            proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, hdr_tree, ta_offset);
-
+          if(anonymize_captures)
+          {
+            add_anonymous_mac(hdr_tree, hf_ieee80211_addr_ta, tvb, ta_offset);
+          }
+          else
+            {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, hdr_tree, ta_offset);
+}
             if (da_offset) {
               bool add_mac = (da_offset >= 16 && da_offset != sa_offset);
+                  if(anonymize_captures)
+    {
+      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_da, tvb, da_offset);
+    }
+    else
               proto_tree_add_mac48_detail(&mac_da, add_mac ? &mac_addr : NULL, ett_addr, tvb, hdr_tree, da_offset);
             }
 
             if (sa_offset) {
               bool add_mac = (sa_offset >= 16);
+                  if(anonymize_captures)
+    {
+      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_sa, tvb, sa_offset);
+    }
+    else
               proto_tree_add_mac48_detail(&mac_sa, add_mac ? &mac_addr : NULL, ett_addr, tvb, hdr_tree, sa_offset);
             }
 
             if (bssid_offset) {
               bool add_mac = (bssid_offset >= 16 && bssid_offset != sa_offset && bssid_offset != da_offset);
-              proto_tree_add_mac48_detail(&mac_bssid, add_mac ? &mac_addr : NULL, ett_addr, tvb, hdr_tree, bssid_offset);
+              if(anonymize_captures)
+        {
+          add_anonymous_mac(hdr_tree, hf_ieee80211_addr_bssid, tvb, bssid_offset);
+        }
+        else
+              {proto_tree_add_mac48_detail(&mac_bssid, add_mac ? &mac_addr : NULL, ett_addr, tvb, hdr_tree, bssid_offset);}
             }
 
             if (addr_type == DATA_ADDR_T4 && is_amsdu) {
-              proto_tree_add_mac48_detail(&mac_bssid, NULL, ett_addr, tvb, hdr_tree, 24);
+              if(anonymize_captures)
+        {
+          add_anonymous_mac(hdr_tree, hf_ieee80211_addr_bssid, tvb, 24);
+        }
+        else
+              {proto_tree_add_mac48_detail(&mac_bssid, NULL, ett_addr, tvb, hdr_tree, 24);}
             }
 
             if (sta_addr_offset > 0) {
@@ -40683,7 +40849,12 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
       switch (frame_type_subtype) {
         case EXTENSION_DMG_BEACON: {
           set_dst_addr_cols(pinfo, tvb, 4, wlan_bssid_address_type);
-          proto_tree_add_mac48_detail(&mac_bssid, &mac_addr, ett_addr, tvb, hdr_tree, 4);
+          if(anonymize_captures)
+        {
+          add_anonymous_mac(hdr_tree, hf_ieee80211_addr_bssid, tvb, 4);
+        }
+        else
+          {proto_tree_add_mac48_detail(&mac_bssid, &mac_addr, ett_addr, tvb, hdr_tree, 4);}
           break;
         }
         case EXTENSION_S1G_BEACON: {
@@ -40698,8 +40869,13 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
           check_s1g_setting(pinfo, tvb, 4);
 
           set_src_addr_cols(pinfo, tvb, 4, wlan_address_type);
-          proto_tree_add_mac48_detail(&mac_sa, &mac_addr, ett_addr, tvb, hdr_tree, 4);
-          break;
+              if(anonymize_captures)
+    {
+      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_sa, tvb, 4);
+    }
+    else
+         { proto_tree_add_mac48_detail(&mac_sa, &mac_addr, ett_addr, tvb, hdr_tree, 4);
+         } break;
         }
       }
     }
@@ -41449,9 +41625,14 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
           proto_item_append_text(parent_item, " #%u", i);
           subframe_tree = proto_item_add_subtree(parent_item, ett_msdu_aggregation_subframe_tree);
           i += 1;
-
-          proto_tree_add_mac48_detail(&mac_da, NULL, ett_addr, next_tvb, subframe_tree, msdu_offset);
-          proto_tree_add_mac48_detail(&mac_sa, NULL, ett_addr, next_tvb, subframe_tree, msdu_offset+6);
+              if(anonymize_captures)
+    {
+      add_anonymous_mac(subframe_tree, hf_ieee80211_addr_da, next_tvb, msdu_offset);
+      add_anonymous_mac(subframe_tree, hf_ieee80211_addr_sa, next_tvb, msdu_offset+6);
+    }
+    else
+{          proto_tree_add_mac48_detail(&mac_da, NULL, ett_addr, next_tvb, subframe_tree, msdu_offset);
+          proto_tree_add_mac48_detail(&mac_sa, NULL, ett_addr, next_tvb, subframe_tree, msdu_offset+6);}
           proto_tree_add_item(subframe_tree, hf_ieee80211_amsdu_length, next_tvb, msdu_offset+12, 2, ENC_BIG_ENDIAN);
 
           msdu_offset += 14;
