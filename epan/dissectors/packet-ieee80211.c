@@ -22589,11 +22589,6 @@ dissect_rsn_ie(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
                                                      FRAME_TYPE_KEY));
 
   if (export_rsn_csv && (ftype == MGT_BEACON || ftype == MGT_PROBE_RESP)) {
-      static bool header_printed = FALSE;
-      if (!header_printed) {
-          printf("BSSID,SSID,Channel,PairwiseCiphers,GroupCipher,AKM,MFPC,MFPR\n");
-          header_printed = TRUE;
-      }
       const char *bssid_str=address_to_str(pinfo->pool,&(pinfo->dl_src)); // src is bssid in beacons and probe resp.;
       uint8_t channel = GPOINTER_TO_UINT(p_get_proto_data(wmem_file_scope(), pinfo, proto_wlan, WLAN_STATS_CHANNEL));;
       const char *ssid_str=p_get_proto_data(wmem_file_scope(), pinfo, proto_wlan, WLAN_STATS_SSID);
@@ -22606,7 +22601,26 @@ dissect_rsn_ie(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
       // verify later
       int mfpc = hf_ieee80211_rsn_cap &(1<<7);
       int mfpr = hf_ieee80211_rsn_cap &(1<<6);
-      printf("%s,%s,%d,%s,%s,%s,%d,%d\n",bssid_str, ssid_str, channel,pairwise_cipher,grp_cipher,akm_cipher,mfpc,mfpr);
+      static FILE *map_file = NULL;
+      static GMutex file_lock;
+
+      g_mutex_lock(&file_lock);
+      
+      if (!map_file) {
+        printf("Writing RSN IE Information to rsn_info.csv\n");
+        fflush(stdout);
+          map_file = fopen("rsn_info.csv", "w");
+      }
+      if(map_file) // might be that due to some issue, map file does not open
+      {
+        static bool header_printed = FALSE;
+        if (!header_printed) {
+            fprintf(map_file,"BSSID,SSID,Channel,PairwiseCiphers,GroupCipher,AKM,MFPC,MFPR\n");
+            header_printed = TRUE;
+        }
+        fprintf(map_file,"%s,%s,%d,%s,%s,%s,%d,%d\n",bssid_str, ssid_str, channel,pairwise_cipher,grp_cipher,akm_cipher,mfpc,mfpr);
+      }
+      g_mutex_unlock(&file_lock);
 
   }
   offset += 2;
