@@ -73,6 +73,8 @@
 #include <epan/unit_strings.h>
 #include <wsutil/array.h>
 #include <wsutil/bits_ctz.h>
+#include <wsutil/file_util.h>
+#include <wsutil/filesystem.h>
 
 #include "packet-wps.h"
 #include "packet-e212.h"
@@ -140,14 +142,15 @@ my_cleanup_cb(wmem_allocator_t */*allocator*/, wmem_cb_event_t event, void */*us
     wmem_list_frame_t *frame;
     static FILE *file = NULL;
     if (file == NULL) {
-        file = fopen("eap_summary.json", "w");
+        file = ws_fopen("eap_summary.json", "w");
         if (file == NULL) {
-            perror("Error: Could not open log file");
+            fprintf(stderr,"Error: Could not open log file");
             exit(1);
         }
     }
     bool is_first_object = true;
     fprintf(file, "\n[\n");
+    printf("EAP Summary\n");
     for (frame = wmem_list_head(tracked_convs); frame; frame = wmem_list_frame_next(frame)) 
     {
         conversation_t *conv = (conversation_t *)wmem_list_frame_data(frame);
@@ -166,7 +169,7 @@ my_cleanup_cb(wmem_allocator_t */*allocator*/, wmem_cb_event_t event, void */*us
                 guint count = wmem_array_get_count(state->timestamps);
                 nstime_t *ts_data = (nstime_t*)wmem_array_get_raw(state->timestamps);
                 for (guint i = 0; i < count; i++) {
-                    fprintf(file, "\"%lld.%09d\"", (long long)ts_data[i].secs, ts_data[i].nsecs);
+                    fprintf(file, "\"%ld.%09d\"", (long)ts_data[i].secs, ts_data[i].nsecs);
                     if (i < count - 1) {
                         fprintf(file, ",");
                     }
@@ -179,9 +182,24 @@ my_cleanup_cb(wmem_allocator_t */*allocator*/, wmem_cb_event_t event, void */*us
             fprintf(file, "\"FourWayHandshakeObserved\":%s", state->four_way_handshake ? "true" : "false");
             fprintf(file, "}");
             is_first_object = false;
+            printf("Client %s associated to %s:\n",
+               state->client_mac ? state->client_mac : "Unknown",
+               state->ssid ? state->ssid : "Unknown");
+
+            printf("  - EAP identity=%s\n",
+                  state->eap_identity ? state->eap_identity : "N/A");
+            printf("  - EAP method=%s%s\n",
+                  state->eap_method ? state->eap_method : "N/A",
+                  state->outer_tls ? " (with outer TLS)" : "");
+
+            printf("  - 4-way handshake was %sseen\n\n",
+                  state->four_way_handshake ? "" : "NOT ");
+            fprintf(file, "\n]\n");
       }
     }
-    fprintf(file, "\n]\n");
+
+
+
   }
   return true;
 }
@@ -1706,7 +1724,7 @@ anonymize_mac(const uint8_t* original_mac, uint8_t* anonymized_mac)
     if (!map_file) {
       printf("Writing MAC Mappings to mac_mapping.txt\n");
       fflush(stdout);
-        map_file = fopen("mac_mapping.txt", "w");
+        map_file = ws_fopen("mac_mapping.txt", "w");
         if (!map_file) {
             g_mutex_unlock(&file_lock);
             printf("Can't open mac_mapping.txt\n");
@@ -22695,12 +22713,11 @@ dissect_rsn_ie(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
       const char *pairwise_cipher = ieee80211_rsn_cipher_vals[GPOINTER_TO_UINT(p_get_proto_data(pinfo->pool, pinfo, proto_wlan, CIPHER_KEY))].strptr;
       const char *grp_cipher = ieee80211_rsn_cipher_vals[GPOINTER_TO_UINT(p_get_proto_data(pinfo->pool, pinfo, proto_wlan, GROUP_CIPHER_KEY))].strptr;
       const char *akm_cipher = ieee80211_rsn_keymgmt_vals[GPOINTER_TO_UINT(p_get_proto_data(pinfo->pool, pinfo, proto_wlan, AKM_KEY))].strptr;
-      // int mfpc = *ieee80211_rsn_cap[5];
-      // int mfpr = *ieee80211_rsn_cap[4];
 
-      // verify later
-      int mfpc = hf_ieee80211_rsn_cap &(1<<7);
-      int mfpr = hf_ieee80211_rsn_cap &(1<<6);
+      uint16_t rsn_cap = tvb_get_letohs(tvb, offset);
+      bool mfpc = ((rsn_cap & (1<<7)) != 0);
+      bool mfpr = ((rsn_cap & (1<<6)) != 0);
+
       static FILE *map_file = NULL;
       static GMutex file_lock;
 
@@ -22709,7 +22726,7 @@ dissect_rsn_ie(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
       if (!map_file) {
         printf("Writing RSN IE Information to rsn_info.csv\n");
         fflush(stdout);
-          map_file = fopen("rsn_info.csv", "w");
+          map_file = ws_fopen("rsn_info.csv", "w");
       }
       if(map_file) // might be that due to some issue, map file does not open
       {
@@ -30732,7 +30749,7 @@ ieee80211_tag_ssid(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* da
       pkt_conversation_setup_helper(pinfo);
       conversation_t *conv = find_or_create_my_conversation(pinfo );
 
-      printf("creating conversation\n");
+      // printf("DEBUG: creating conversation\n");
       handshake_state_t *state = (handshake_state_t *)conversation_get_proto_data(conv, proto_eap_additional);
       if (!state) {
         wmem_list_append(tracked_convs, conv);
