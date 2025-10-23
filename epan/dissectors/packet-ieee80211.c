@@ -101,6 +101,10 @@ typedef struct {
   wmem_array_t *timestamps;
 } handshake_state_t;
 
+bool export_rsn_csv __attribute__((visibility("default")))= false; // use in tshark.c
+bool anonymize_captures __attribute__((visibility("default")))= false; // use in tshark.c
+bool eap_summary_ieee __attribute__((visibility("default")))= false; // use in tshark.c
+
 static void pkt_conversation_setup_helper(packet_info *pinfo)
 {
   pinfo->srcport = 0;
@@ -138,6 +142,8 @@ static conversation_t *find_my_conversation(packet_info *pinfo)
 static bool
 my_cleanup_cb(wmem_allocator_t */*allocator*/, wmem_cb_event_t event, void */*user_data*/)
 {
+  if(!eap_summary_ieee)
+    return true;
   if (event == WMEM_CB_FREE_EVENT) {
     wmem_list_frame_t *frame;
     static FILE *file = NULL;
@@ -150,7 +156,7 @@ my_cleanup_cb(wmem_allocator_t */*allocator*/, wmem_cb_event_t event, void */*us
     }
     bool is_first_object = true;
     fprintf(file, "\n[\n");
-    printf("EAP Summary\n");
+    printf("EAP Summary. Written in JSON format in eap_summary.json\n");
     for (frame = wmem_list_head(tracked_convs); frame; frame = wmem_list_frame_next(frame)) 
     {
         conversation_t *conv = (conversation_t *)wmem_list_frame_data(frame);
@@ -210,9 +216,6 @@ typedef struct {
   uint8_t *keydata;
 } proto_keydata_t;
 
-bool export_rsn_csv __attribute__((visibility("default")))= false; // use in tshark.c
-bool anonymize_captures __attribute__((visibility("default")))= false; // use in tshark.c
-bool eap_summary_ieee __attribute__((visibility("default")))= false; // use in tshark.c
 
 extern value_string_ext eap_type_vals_ext; /* from packet-eap.c */
 
@@ -1718,19 +1721,30 @@ anonymize_mac(const uint8_t* original_mac, uint8_t* anonymized_mac)
     memcpy(anonymized_mac, &hash, 6);
     static FILE *map_file = NULL;
     static GMutex file_lock;
+    static GHashTable *written_macs = NULL;
 
     g_mutex_lock(&file_lock);
     
     if (!map_file) {
       printf("Writing MAC Mappings to mac_mapping.txt\n");
       fflush(stdout);
-        map_file = ws_fopen("mac_mapping.txt", "w");
-        if (!map_file) {
-            g_mutex_unlock(&file_lock);
-            printf("Can't open mac_mapping.txt\n");
-            return; // Fail silently if file can't be opened
-        }
+      written_macs = g_hash_table_new_full(g_bytes_hash, g_bytes_equal, g_free, NULL);
+      map_file = ws_fopen("mac_mapping.txt", "w");
+      if (!map_file) {
+          g_mutex_unlock(&file_lock);
+          printf("Can't open mac_mapping.txt\n");
+          return; // Fail silently if file can't be opened
+      }
     }
+
+    GBytes *key = g_bytes_new(original_mac, 6);
+
+    if (g_hash_table_contains(written_macs, key)) {
+        g_bytes_unref(key);
+        g_mutex_unlock(&file_lock);
+        return;
+    }
+
 
     fprintf(map_file,
             "%02X:%02X:%02X:%02X:%02X:%02X -> %02X:%02X:%02X:%02X:%02X:%02X\n",
@@ -1740,18 +1754,12 @@ anonymize_mac(const uint8_t* original_mac, uint8_t* anonymized_mac)
             anonymized_mac[3], anonymized_mac[4], anonymized_mac[5]);
 
     fflush(map_file);
+
+    g_hash_table_add(written_macs, key);
     g_mutex_unlock(&file_lock);
 
 }
 
-static void add_anonymous_mac(proto_tree *hdr_tree,int hf,tvbuff_t *tvb,   int offset)
-{
-  uint8_t original_mac_addr[6];
-  tvb_memcpy(tvb, original_mac_addr, offset, 6);
-  uint8_t new_mac_addr[6];
-  anonymize_mac(original_mac_addr, new_mac_addr);
-  proto_tree_add_ether(hdr_tree, hf, tvb, offset, 6, new_mac_addr);
-}
 /* ANQP information ID - IEEE Std 802.11u-2011 - Table 7-43bk */
 static const value_string anqp_info_id_vals[] = {
   {ANQP_INFO_ANQP_QUERY_LIST, "ANQP Query list"},
@@ -9217,6 +9225,32 @@ static const value_string ff_psmp_sta_info_flags[] = {
   { PSMP_STA_INFO_INDIVIDUALLY_ADDRESSED, "Individually Addressed"},
   {0, NULL}
 };
+static void set_anonymous_address_tvb(address *addr,int type, tvbuff_t *tvb,int offset)
+{
+  uint8_t original_mac_addr[6];
+  tvb_memcpy(tvb, original_mac_addr, offset, 6);
+  uint8_t *new_mac_addr = (uint8_t *)wmem_alloc(wmem_file_scope(), 6);
+  anonymize_mac(original_mac_addr, new_mac_addr);
+  set_address(addr, type, 6, new_mac_addr);
+}
+static void add_anonymous_mac(packet_info *pinfo, proto_tree *hdr_tree,int hf,tvbuff_t *tvb,   int offset)
+{
+  uint8_t original_mac_addr[6];
+  tvb_memcpy(tvb, original_mac_addr, offset, 6);
+  uint8_t *new_mac_addr = (uint8_t *)wmem_alloc(pinfo->pool, 6);
+  anonymize_mac(original_mac_addr, new_mac_addr);
+  proto_tree_add_ether(hdr_tree, hf, tvb, offset, 6, new_mac_addr);
+  if(hf==hf_ieee80211_addr_sa)
+  {
+    set_address(&pinfo->dl_src, AT_ETHER, 6, new_mac_addr);
+    set_address(&pinfo->src, AT_ETHER, 6, new_mac_addr);
+  }
+  else if(hf ==hf_ieee80211_addr_da)
+  {
+    set_address(&pinfo->dl_dst, AT_ETHER, 6, new_mac_addr);
+    set_address(&pinfo->dst, AT_ETHER, 6, new_mac_addr);
+  }
+}
 
 static const char*
 wlan_conv_get_filter_type(conv_item_t* conv, conv_filter_type_e filter)
@@ -38210,7 +38244,7 @@ dissect_ieee80211_block_ack(tvbuff_t *tvb, packet_info *pinfo _U_,
 {
   if(anonymize_captures)
   {
-    add_anonymous_mac(tree,hf_ieee80211_addr_ta, tvb, offset);
+    add_anonymous_mac(pinfo, tree,hf_ieee80211_addr_ta, tvb, offset);
   }
   else
   {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, tree, offset);}
@@ -38985,7 +39019,7 @@ dissect_ieee80211_he_eht_trigger(tvbuff_t *tvb, packet_info *pinfo,
 
   if(anonymize_captures)
   {
-    add_anonymous_mac(tree,hf_ieee80211_addr_ta, tvb, offset);
+    add_anonymous_mac(pinfo, tree,hf_ieee80211_addr_ta, tvb, offset);
   }
   else
   {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, tree, offset);}
@@ -39094,7 +39128,7 @@ dissect_ieee80211_s1g_tack(tvbuff_t *tvb, packet_info *pinfo _U_,
   int             length = 0;
   if(anonymize_captures)
   {
-    add_anonymous_mac(tree,hf_ieee80211_addr_ta, tvb, offset);
+    add_anonymous_mac(pinfo, tree,hf_ieee80211_addr_ta, tvb, offset);
   }
   else
   {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, tree, offset);}
@@ -39398,7 +39432,7 @@ dissect_ieee80211_ndp_annc(tvbuff_t *tvb, packet_info *pinfo _U_,
   uint8_t          dialog_token;
   if(anonymize_captures)
   {
-    add_anonymous_mac(tree,hf_ieee80211_addr_ta, tvb, offset);
+    add_anonymous_mac(pinfo, tree,hf_ieee80211_addr_ta, tvb, offset);
   }
   else
   {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, tree, offset);}
@@ -39437,7 +39471,12 @@ dissect_ieee80211_ndp_annc(tvbuff_t *tvb, packet_info *pinfo _U_,
 static void
 set_src_addr_cols(packet_info *pinfo, tvbuff_t *tvb, int offset, int type)
 {
-  set_address_tvb(&pinfo->dl_src, type, 6, tvb, offset);
+  if(!anonymize_captures)
+    set_address_tvb(&pinfo->dl_src, type, 6, tvb, offset);
+  else
+  {
+    set_anonymous_address_tvb(&pinfo->dl_src, type, tvb, offset);
+  }
   copy_address_shallow(&pinfo->src, &pinfo->dl_src);
   // Should we call proto_tree_add_mac48_detail here?
 }
@@ -39445,7 +39484,12 @@ set_src_addr_cols(packet_info *pinfo, tvbuff_t *tvb, int offset, int type)
 static void
 set_dst_addr_cols(packet_info *pinfo, tvbuff_t *tvb, int offset, int type)
 {
-  set_address_tvb(&pinfo->dl_dst, type, 6, tvb, offset);
+  if(!anonymize_captures)
+    set_address_tvb(&pinfo->dl_dst, type, 6, tvb, offset);
+  else
+  {
+    set_anonymous_address_tvb(&pinfo->dl_dst, type, tvb, offset);
+  }
   copy_address_shallow(&pinfo->dst, &pinfo->dl_dst);
   // Should we call proto_tree_add_mac48_detail here?
 }
@@ -39587,6 +39631,7 @@ set_sid_addr_cols(packet_info *pinfo, uint16_t sid, bool dst)
 {
   uint16_t* aid = wmem_new0(pinfo->pool, uint16_t);
   *aid = sid & SID_AID_MASK;
+  // no need to anonymize here
   if (dst) {
     set_address(&pinfo->dl_dst, wlan_aid_address_type, (int)sizeof(*aid), aid);
     copy_address_shallow(&pinfo->dst, &pinfo->dl_dst);
@@ -40002,7 +40047,7 @@ dissect_ieee80211_pv1(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree,
 
     if(anonymize_captures)
     {
-      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_ra, tvb, offset);
+      add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_ra, tvb, offset);
     }
     else
     {proto_tree_add_mac48_detail(&mac_ra, &mac_addr, ett_addr, tvb, hdr_tree, offset);}
@@ -40024,7 +40069,7 @@ dissect_ieee80211_pv1(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree,
     set_src_addr_cols(pinfo, tvb, offset, wlan_ra_ta_address_type);
       if(anonymize_captures)
   {
-    add_anonymous_mac(hdr_tree,hf_ieee80211_addr_ta, tvb, offset);
+    add_anonymous_mac(pinfo, hdr_tree,hf_ieee80211_addr_ta, tvb, offset);
   }
   else
     {proto_tree_add_mac48_detail(&mac_ta, NULL, ett_addr, tvb, hdr_tree, offset);}
@@ -40050,7 +40095,7 @@ dissect_ieee80211_pv1(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree,
     set_dst_addr_cols(pinfo, tvb, offset, wlan_address_type);
     if(anonymize_captures)
     {
-      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_da, tvb, offset);
+      add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_da, tvb, offset);
     }
     else
     {proto_tree_add_mac48_detail(&mac_da, &mac_addr, ett_addr, tvb, hdr_tree, offset);}
@@ -40061,7 +40106,7 @@ dissect_ieee80211_pv1(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree,
     set_src_addr_cols(pinfo, tvb, offset, wlan_address_type);
     if(anonymize_captures)
     {
-      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_sa, tvb, offset);
+      add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_sa, tvb, offset);
     }
     else
     {proto_tree_add_mac48_detail(&mac_sa, &mac_addr, ett_addr, tvb, hdr_tree, offset);}
@@ -40514,7 +40559,7 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
   /* all frames have address 1 = RA */
   if(anonymize_captures)
     {
-      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_ra, tvb, 4);
+      add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_ra, tvb, 4);
     }
   else
     {proto_tree_add_mac48_detail(&mac_ra, &mac_addr, ett_addr, tvb, hdr_tree, 4);
@@ -40531,7 +40576,12 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
       set_src_addr_cols(pinfo, tvb, 10, wlan_address_type);
 
       /* for tap */
+      if(!anonymize_captures)
       set_address_tvb(&whdr->bssid, wlan_bssid_address_type, 6, tvb, 16);
+      else
+      {
+        set_anonymous_address_tvb(&whdr->bssid, wlan_bssid_address_type, tvb, 16);
+      }
       copy_address_shallow(&whdr->src, &pinfo->dl_src);
       copy_address_shallow(&whdr->dst, &pinfo->dl_dst);
       if (addresses_data_equal(&whdr->bssid, &whdr->src)) {
@@ -40552,9 +40602,9 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
       {
           if(anonymize_captures)
     {
-      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_da, tvb, 4);
-      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_ta, tvb, 10);
-      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_sa, tvb, 10);
+      add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_da, tvb, 4);
+      add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_ta, tvb, 10);
+      add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_sa, tvb, 10);
     }
     else
         {proto_tree_add_mac48_detail(&mac_da, NULL, ett_addr, tvb, hdr_tree, 4);
@@ -40564,7 +40614,7 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
 
         if(anonymize_captures)
         {
-          add_anonymous_mac(hdr_tree, hf_ieee80211_addr_bssid, tvb, 16);
+          add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_bssid, tvb, 16);
         }
         else
         {
@@ -40625,7 +40675,7 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
         addr1_type = wlan_bssid_address_type;
         if(anonymize_captures)
         {
-          add_anonymous_mac(hdr_tree, hf_ieee80211_addr_bssid, tvb, 4);
+          add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_bssid, tvb, 4);
         }
         else
         {proto_tree_add_mac48_detail(&mac_bssid, NULL, ett_addr, tvb, hdr_tree, 4);}
@@ -40662,7 +40712,7 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
           set_src_addr_cols(pinfo, tvb, offset, wlan_ra_ta_address_type);
           if(anonymize_captures)
           {
-            add_anonymous_mac(hdr_tree, hf_ieee80211_addr_ta, tvb, offset);
+            add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_ta, tvb, offset);
           }
           else
           {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, hdr_tree, offset);}
@@ -40681,14 +40731,14 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
             if (isDMG) {
               if(anonymize_captures)
           {
-            add_anonymous_mac(hdr_tree, hf_ieee80211_addr_ta, tvb, offset);
+            add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_ta, tvb, offset);
           }
           else
               {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, hdr_tree, offset);}
             } else {
               if(anonymize_captures)
         {
-          add_anonymous_mac(hdr_tree, hf_ieee80211_addr_bssid, tvb, offset);
+          add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_bssid, tvb, offset);
         }
         else
               {proto_tree_add_mac48_detail(&mac_bssid, &mac_addr, ett_addr, tvb, hdr_tree, offset);}
@@ -40719,7 +40769,7 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
           set_src_addr_cols(pinfo, tvb, offset, wlan_ra_ta_address_type);
           if(anonymize_captures)
           {
-            add_anonymous_mac(hdr_tree, hf_ieee80211_addr_ta, tvb, offset);
+            add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_ta, tvb, offset);
           }
           else
           {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, hdr_tree, offset);}
@@ -40747,7 +40797,7 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
           set_src_addr_cols(pinfo, tvb, offset, wlan_ra_ta_address_type);
           if(anonymize_captures)
           {
-            add_anonymous_mac(hdr_tree, hf_ieee80211_addr_ta, tvb, offset);
+            add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_ta, tvb, offset);
           }
           else
           {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, hdr_tree, offset);}
@@ -40892,11 +40942,21 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
       }
 
       if (src_offset) {
+        if(!anonymize_captures)
         set_address_tvb(&pinfo->dl_src, wlan_address_type, 6, tvb, src_offset);
+        else
+        {
+          set_anonymous_address_tvb(&pinfo->dl_src, wlan_address_type, tvb, src_offset);
+        }
         copy_address_shallow(&pinfo->src, &pinfo->dl_src);
       }
       if (dst_offset) {
-        set_address_tvb(&pinfo->dl_dst, wlan_address_type, 6, tvb, dst_offset);
+        if(!anonymize_captures)
+          set_address_tvb(&pinfo->dl_dst, wlan_address_type, 6, tvb, dst_offset);
+        else
+        {
+          set_anonymous_address_tvb(&pinfo->dl_dst, wlan_address_type, tvb, dst_offset);
+        }
         copy_address_shallow(&pinfo->dst, &pinfo->dl_dst);
       }
 
@@ -40943,7 +41003,7 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
           case DATA_ADDR_T4:
           if(anonymize_captures)
           {
-            add_anonymous_mac(hdr_tree, hf_ieee80211_addr_ta, tvb, ta_offset);
+            add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_ta, tvb, ta_offset);
           }
           else
             {proto_tree_add_mac48_detail(&mac_ta, &mac_addr, ett_addr, tvb, hdr_tree, ta_offset);
@@ -40952,7 +41012,7 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
               bool add_mac = (da_offset >= 16 && da_offset != sa_offset);
                   if(anonymize_captures)
     {
-      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_da, tvb, da_offset);
+      add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_da, tvb, da_offset);
     }
     else
               proto_tree_add_mac48_detail(&mac_da, add_mac ? &mac_addr : NULL, ett_addr, tvb, hdr_tree, da_offset);
@@ -40962,7 +41022,7 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
               bool add_mac = (sa_offset >= 16);
                   if(anonymize_captures)
     {
-      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_sa, tvb, sa_offset);
+      add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_sa, tvb, sa_offset);
     }
     else
               proto_tree_add_mac48_detail(&mac_sa, add_mac ? &mac_addr : NULL, ett_addr, tvb, hdr_tree, sa_offset);
@@ -40972,7 +41032,7 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
               bool add_mac = (bssid_offset >= 16 && bssid_offset != sa_offset && bssid_offset != da_offset);
               if(anonymize_captures)
         {
-          add_anonymous_mac(hdr_tree, hf_ieee80211_addr_bssid, tvb, bssid_offset);
+          add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_bssid, tvb, bssid_offset);
         }
         else
               {proto_tree_add_mac48_detail(&mac_bssid, add_mac ? &mac_addr : NULL, ett_addr, tvb, hdr_tree, bssid_offset);}
@@ -40981,7 +41041,7 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
             if (addr_type == DATA_ADDR_T4 && is_amsdu) {
               if(anonymize_captures)
         {
-          add_anonymous_mac(hdr_tree, hf_ieee80211_addr_bssid, tvb, 24);
+          add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_bssid, tvb, 24);
         }
         else
               {proto_tree_add_mac48_detail(&mac_bssid, NULL, ett_addr, tvb, hdr_tree, 24);}
@@ -41005,7 +41065,7 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
           set_dst_addr_cols(pinfo, tvb, 4, wlan_bssid_address_type);
           if(anonymize_captures)
         {
-          add_anonymous_mac(hdr_tree, hf_ieee80211_addr_bssid, tvb, 4);
+          add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_bssid, tvb, 4);
         }
         else
           {proto_tree_add_mac48_detail(&mac_bssid, &mac_addr, ett_addr, tvb, hdr_tree, 4);}
@@ -41025,7 +41085,7 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
           set_src_addr_cols(pinfo, tvb, 4, wlan_address_type);
               if(anonymize_captures)
     {
-      add_anonymous_mac(hdr_tree, hf_ieee80211_addr_sa, tvb, 4);
+      add_anonymous_mac(pinfo, hdr_tree, hf_ieee80211_addr_sa, tvb, 4);
     }
     else
          { proto_tree_add_mac48_detail(&mac_sa, &mac_addr, ett_addr, tvb, hdr_tree, 4);
@@ -41781,8 +41841,8 @@ dissect_ieee80211_pv0(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
           i += 1;
               if(anonymize_captures)
     {
-      add_anonymous_mac(subframe_tree, hf_ieee80211_addr_da, next_tvb, msdu_offset);
-      add_anonymous_mac(subframe_tree, hf_ieee80211_addr_sa, next_tvb, msdu_offset+6);
+      add_anonymous_mac(pinfo, subframe_tree, hf_ieee80211_addr_da, next_tvb, msdu_offset);
+      add_anonymous_mac(pinfo, subframe_tree, hf_ieee80211_addr_sa, next_tvb, msdu_offset+6);
     }
     else
 {          proto_tree_add_mac48_detail(&mac_da, NULL, ett_addr, next_tvb, subframe_tree, msdu_offset);

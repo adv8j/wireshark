@@ -2131,26 +2131,27 @@ dissect_eap(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
       }
     }
   }
-  pkt_conversation_setup_helper(pinfo);
-  conversation_t *conv = find_my_conversation(pinfo);
+  if(eap_summary){
+    pkt_conversation_setup_helper(pinfo);
+    conversation_t *conv = find_my_conversation(pinfo);
 
-  if(!conv)
-  {
-    printf("ERROR: Unable to find conversation from beginning for aggregation (8)\n");
-  }
-  else
-  {
-    handshake_state_t *state = (handshake_state_t *)conversation_get_proto_data(conv, proto_eap_additional);
-    if (!state) 
+    if(!conv)
     {
-      printf("ERROR: Unable to find state from beginning for aggregation (7)\n");
+      printf("ERROR: Unable to find conversation from beginning for aggregation (8)\n");
     }
     else
     {
-      wmem_array_append_one(state->timestamps,pinfo->rel_ts);
+      handshake_state_t *state = (handshake_state_t *)conversation_get_proto_data(conv, proto_eap_additional);
+      if (!state)
+      {
+        printf("ERROR: Unable to find state from beginning for aggregation (7)\n");
+      }
+      else
+      {
+        wmem_array_append_one(state->timestamps,pinfo->rel_ts);
+      }
     }
   }
-  
 
   switch (eap_code) {
 
@@ -2167,6 +2168,8 @@ dissect_eap(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
                                      "Unknown type (0x%02x)"));
     eap_type_item = proto_tree_add_item(eap_tree, hf_eap_type, tvb, 4, 1, ENC_BIG_ENDIAN);
     if(eap_summary){
+      pkt_conversation_setup_helper(pinfo);
+      conversation_t *conv = find_my_conversation(pinfo);
       if(!conv)
       {
         printf("ERROR: Unable to find conversatoin from beginning for aggregation (3)\n");
