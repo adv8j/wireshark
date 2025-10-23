@@ -145,12 +145,14 @@
 #define LONGOPT_COMPRESS                LONGOPT_BASE_APPLICATION+11
 #define LONGOPT_EXPORT_RSN_CSV         LONGOPT_BASE_APPLICATION+12
 #define LONGOPT_ANONYMIZE               LONGOPT_BASE_APPLICATION+13
-
+#define LONGOPT_EAP_SUMMARY               LONGOPT_BASE_APPLICATION+14
 capture_file cfile;
 
 extern bool export_rsn_csv;
 extern bool anonymize_captures;
 extern bool anonymize_identity;
+extern bool eap_summary;
+extern bool eap_summary_ieee;
 static uint32_t cum_bytes;
 static frame_data ref_frame;
 static frame_data prev_dis_frame;
@@ -1070,6 +1072,7 @@ main(int argc, char *argv[])
         {"compress", ws_required_argument, NULL, LONGOPT_COMPRESS},
         { "export-rsn-csv", ws_no_argument, NULL, LONGOPT_EXPORT_RSN_CSV },
         { "anonymize", ws_no_argument, NULL, LONGOPT_ANONYMIZE },
+        { "eap-summary", ws_no_argument, NULL, LONGOPT_EAP_SUMMARY },
         {0, 0, 0, 0}
     };
     bool                 arg_error = false;
@@ -1431,6 +1434,10 @@ main(int argc, char *argv[])
             case LONGOPT_ANONYMIZE:
                 anonymize_captures = true;
                 anonymize_identity = true;
+                break;
+            case LONGOPT_EAP_SUMMARY:
+                eap_summary = true;
+                eap_summary_ieee = true;
                 break;
             case '2':        /* Perform two-pass analysis */
                 if(epan_auto_reset){

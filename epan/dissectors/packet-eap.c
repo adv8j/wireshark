@@ -32,6 +32,64 @@ void proto_reg_handoff_eap(void);
 #include <string.h>
 #include <glib.h>
 
+static conversation_t *find_my_conversation(packet_info *pinfo)
+{
+  conversation_t *conv = NULL;
+  conv = find_conversation(pinfo->num, &pinfo->src, &pinfo->dst, CONVERSATION_NONE,0, 0, NO_ADDR_B | NO_PORT_B);
+
+  if (conv == NULL) {
+      conv = find_conversation(pinfo->num, &pinfo->dst, &pinfo->src, CONVERSATION_NONE,0, 0, NO_ADDR_B | NO_PORT_B);
+  }
+  return conv;
+}
+static int proto_eap_additional = 23345;
+bool eap_summary __attribute__((visibility("default")))= false; // use in tshark.c
+typedef struct {
+  char* ssid;
+  char *client_mac;
+  char *eap_identity;
+  char *eap_method;
+  bool outer_tls;
+  bool four_way_handshake;
+  wmem_array_t *timestamps;
+} handshake_state_t;
+
+static void pkt_conversation_setup_helper(packet_info *pinfo)
+{
+  pinfo->srcport = 0;
+  pinfo->destport = 0;
+  copy_address_shallow(&pinfo->src,&pinfo->dl_src);
+  copy_address_shallow(&pinfo->dst,&pinfo->dl_dst);
+  pinfo->ptype = PT_NONE;
+}
+
+static void add_identity_to_eap_summary(packet_info *pinfo, tvbuff_t *tvb,int offset, int len)
+{
+  if(!eap_summary)
+  {  return;}
+  pkt_conversation_setup_helper(pinfo);
+  conversation_t *conv = find_my_conversation(pinfo);
+
+    if(!conv)
+    {
+      printf("ERROR: Unable to find conversation from beginning for aggregation (1)\n");
+    }
+    else
+    {
+      handshake_state_t *state = (handshake_state_t *)conversation_get_proto_data(conv, proto_eap_additional);
+      if (!state) 
+      {
+        printf("ERROR: Unable to find state from beginning for aggregation (2)\n");
+      }
+      else
+      {
+        char *identity = wmem_alloc(wmem_file_scope(),len+1);
+        tvb_memcpy(tvb, identity, offset, len);
+        identity[len] = '\0';
+        state->eap_identity = identity;
+      }
+    }
+}
 static void
 anonymize_identity_fn(const uint8_t* identity, size_t length)
 {
@@ -81,7 +139,7 @@ anonymize_identity_fn(const uint8_t* identity, size_t length)
 static proto_item* add_anonymous_identity(proto_tree *hdr_tree,int hf,tvbuff_t *tvb,   int offset, int len)
 {
   // did malloc coz stack allocation of size 2^16 not permitted
-  uint8_t *identity = malloc(len+1);
+  uint8_t *identity = wmem_alloc(wmem_file_scope(),len+1);
   tvb_memcpy(tvb, identity, offset, len);
   // uint8_t new_identity[65536];
   anonymize_identity_fn(identity, len);
@@ -1054,6 +1112,7 @@ dissect_eap_identity_3gpp(tvbuff_t *tvb, packet_info* pinfo, proto_tree* tree, i
     }
     else
       {proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset, (int)strlen(tokens[0]), ENC_ASCII);}
+      add_identity_to_eap_summary(pinfo,tvb,offset,(int)strlen(tokens[0]));
 
       offset += (int)(strlen(tokens[0]) + 1 + strlen("CertificateSerialNumber="));
       const char* cert = tokens[1] + strlen("CertificateSerialNumber=");
@@ -1143,6 +1202,7 @@ dissect_eap_identity_3gpp(tvbuff_t *tvb, packet_info* pinfo, proto_tree* tree, i
         }
         else
           {proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset + 1, (unsigned)strlen(tokens[0]) - 1, ENC_ASCII);}
+          add_identity_to_eap_summary(pinfo,tvb,offset+1,(int)strlen(tokens[0]) - 1);
           break;
         case '4': /* EAP-AKA Reauth ID */
         case '5': /* EAP-SIM Reauth ID */
@@ -1153,6 +1213,7 @@ dissect_eap_identity_3gpp(tvbuff_t *tvb, packet_info* pinfo, proto_tree* tree, i
         }
         else
           {proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset + 1, (unsigned)strlen(tokens[0]) - 1, ENC_ASCII);}
+          add_identity_to_eap_summary(pinfo,tvb,offset+1,(int)strlen(tokens[0])-1);
           break;
         case 'C': /* Conservative Peer */
         if (anonymize_identity)
@@ -1161,6 +1222,7 @@ dissect_eap_identity_3gpp(tvbuff_t *tvb, packet_info* pinfo, proto_tree* tree, i
         }
         else
           {proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset + 1, (unsigned)strlen(tokens[0]) - 1, ENC_ASCII);}
+          add_identity_to_eap_summary(pinfo,tvb,offset+1,(int)strlen(tokens[0])-1);
           break;
         case 'a': /* Anonymous User */
           /* This is not really a prefix, just a username "anonymous" */
@@ -1170,6 +1232,7 @@ dissect_eap_identity_3gpp(tvbuff_t *tvb, packet_info* pinfo, proto_tree* tree, i
         }
         else
           {proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset, (unsigned)strlen(tokens[0]), ENC_ASCII);}
+          add_identity_to_eap_summary(pinfo,tvb,offset,(int)strlen(tokens[0]));
           break;
         case 'G': /* TODO: 'G' Unknown */
         case 'I': /* TODO: 'I' Unknown */
@@ -1180,6 +1243,7 @@ dissect_eap_identity_3gpp(tvbuff_t *tvb, packet_info* pinfo, proto_tree* tree, i
           }
           else
           {proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset + 1, (unsigned)strlen(tokens[0]) - 1, ENC_ASCII);}
+          add_identity_to_eap_summary(pinfo,tvb,offset+1,(int)strlen(tokens[0])-1);
           expert_add_info(pinfo, item, &ei_eap_identity_invalid);
       }
     } else {
@@ -1190,6 +1254,7 @@ dissect_eap_identity_3gpp(tvbuff_t *tvb, packet_info* pinfo, proto_tree* tree, i
         }
         else
       {proto_tree_add_item(eap_identity_tree, hf_eap_identity, tvb, offset, (int)strlen(tokens[0]), ENC_ASCII);}
+      add_identity_to_eap_summary(pinfo,tvb,offset,(int)strlen(tokens[0]));
     }
   }
 
@@ -1258,6 +1323,8 @@ dissect_eap_identity(tvbuff_t *tvb, packet_info* pinfo, proto_tree* tree, int of
   if (!dissect_eap_identity_3gpp(tvb, pinfo, tree, offset, size)) {
 
     item = anonymize_identity?add_anonymous_identity(tree, hf_eap_identity, tvb, offset, size):proto_tree_add_item(tree, hf_eap_identity, tvb, offset, size, ENC_ASCII);
+    add_identity_to_eap_summary(pinfo,tvb,offset,size);
+
     /* XXX - RFC 7542 revises earlier standards by allowing UTF-8 in the
      * NAI (username and realm); if this happens in EAP, remove the expert info. */
     if (tvb_ascii_isprint(tvb, offset, size) == false) {
@@ -2063,6 +2130,26 @@ dissect_eap(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
       }
     }
   }
+  pkt_conversation_setup_helper(pinfo);
+  conversation_t *conv = find_my_conversation(pinfo);
+
+  if(!conv)
+  {
+    printf("ERROR: Unable to find conversation from beginning for aggregation (8)\n");
+  }
+  else
+  {
+    handshake_state_t *state = (handshake_state_t *)conversation_get_proto_data(conv, proto_eap_additional);
+    if (!state) 
+    {
+      printf("ERROR: Unable to find state from beginning for aggregation (7)\n");
+    }
+    else
+    {
+      wmem_array_append_one(state->timestamps,pinfo->rel_ts);
+    }
+  }
+  
 
   switch (eap_code) {
 
@@ -2078,6 +2165,31 @@ dissect_eap(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
                       val_to_str_ext(pinfo->pool, eap_type, &eap_type_vals_ext,
                                      "Unknown type (0x%02x)"));
     eap_type_item = proto_tree_add_item(eap_tree, hf_eap_type, tvb, 4, 1, ENC_BIG_ENDIAN);
+    if(eap_summary){
+      if(!conv)
+      {
+        printf("ERROR: Unable to find conversatoin from beginning for aggregation (3)\n");
+      }
+      else
+      {
+        handshake_state_t *state = (handshake_state_t *)conversation_get_proto_data(conv, proto_eap_additional);
+        if (!state) 
+        {
+          printf("ERROR: Unable to find state from beginning for aggregation (4)\n");
+        }
+        else
+        {
+          uint8_t eap_type_value = tvb_get_uint8(tvb, 4);
+          state->eap_method = wmem_alloc(wmem_file_scope(),strlen(eap_type_vals[eap_type_value].strptr)+1);
+          memcpy(state->eap_method,eap_type_vals[eap_type_value].strptr,strlen(eap_type_vals[eap_type_value].strptr));
+          state->eap_method[strlen(eap_type_vals[eap_type_value].strptr)] = '\0';
+          if(eap_type_value==13 || eap_type_value==25)
+          {
+            state->outer_tls = true;
+          }
+        }
+      }
+    }
 
     if ((len > 5) || ((len == 5) && (eap_type == EAP_TYPE_ID))) {
       int     offset = 5;

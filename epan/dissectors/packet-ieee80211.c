@@ -86,6 +86,105 @@ void proto_reg_handoff_ieee80211(void);
 void proto_register_wlan_rsna_eapol(void);
 
 static dissector_handle_t centrino_handle;
+static wmem_list_t *tracked_convs = NULL;
+
+static int proto_eap_additional = 23345;
+typedef struct {
+  char* ssid;
+  char *client_mac;
+  char *eap_identity;
+  char *eap_method;
+  bool outer_tls;
+  bool four_way_handshake;
+  wmem_array_t *timestamps;
+} handshake_state_t;
+
+static void pkt_conversation_setup_helper(packet_info *pinfo)
+{
+  pinfo->srcport = 0;
+  pinfo->destport = 0;
+  copy_address_shallow(&pinfo->src,&pinfo->dl_src);
+  copy_address_shallow(&pinfo->dst,&pinfo->dl_dst);
+  pinfo->ptype = PT_NONE;
+}
+
+static conversation_t *find_or_create_my_conversation(packet_info *pinfo)
+{
+  conversation_t *conv = NULL;
+  conv = find_conversation(pinfo->num, &pinfo->src, &pinfo->dst, CONVERSATION_NONE,0, 0, NO_ADDR_B | NO_PORT_B);
+
+  if (conv == NULL) {
+      conv = find_conversation(pinfo->num, &pinfo->dst, &pinfo->src, CONVERSATION_NONE,0, 0, NO_ADDR_B | NO_PORT_B);
+  }
+  if (conv == NULL) {
+      conv = conversation_new(pinfo->num, &pinfo->src, &pinfo->dst, CONVERSATION_NONE,0, 0, NO_ADDR2 | NO_PORT2);
+  }
+  return conv;
+}
+
+static conversation_t *find_my_conversation(packet_info *pinfo)
+{
+  conversation_t *conv = NULL;
+  conv = find_conversation(pinfo->num, &pinfo->src, &pinfo->dst, CONVERSATION_NONE,0, 0, NO_ADDR_B | NO_PORT_B);
+
+  if (conv == NULL) {
+      conv = find_conversation(pinfo->num, &pinfo->dst, &pinfo->src, CONVERSATION_NONE,0, 0, NO_ADDR_B | NO_PORT_B);
+  }
+  return conv;
+}
+
+static bool
+my_cleanup_cb(wmem_allocator_t */*allocator*/, wmem_cb_event_t event, void */*user_data*/)
+{
+  if (event == WMEM_CB_FREE_EVENT) {
+    wmem_list_frame_t *frame;
+    static FILE *file = NULL;
+    if (file == NULL) {
+        file = fopen("eap_summary.json", "w");
+        if (file == NULL) {
+            perror("Error: Could not open log file");
+            exit(1);
+        }
+    }
+    bool is_first_object = true;
+    fprintf(file, "\n[\n");
+    for (frame = wmem_list_head(tracked_convs); frame; frame = wmem_list_frame_next(frame)) 
+    {
+        conversation_t *conv = (conversation_t *)wmem_list_frame_data(frame);
+        handshake_state_t *state = (handshake_state_t *)conversation_get_proto_data(conv, proto_eap_additional);
+
+        if (state) {
+            if (!is_first_object) {
+                fprintf(file, ",\n");
+            }
+            fprintf(file, "  {");
+            fprintf(file, "\"ClientMAC\":\"%s\", ", state->client_mac ? state->client_mac : "null");
+            fprintf(file, "\"SSID\":\"%s\", ", state->ssid ? state->ssid : "null");
+
+            fprintf(file, "\"Timestamps\":[");
+            if (state->timestamps) {
+                guint count = wmem_array_get_count(state->timestamps);
+                nstime_t *ts_data = (nstime_t*)wmem_array_get_raw(state->timestamps);
+                for (guint i = 0; i < count; i++) {
+                    fprintf(file, "\"%lld.%09d\"", (long long)ts_data[i].secs, ts_data[i].nsecs);
+                    if (i < count - 1) {
+                        fprintf(file, ",");
+                    }
+                }
+            }
+            fprintf(file, "], ");
+            fprintf(file, "\"EAPIdentity\":\"%s\", ", state->eap_identity ? state->eap_identity : "null");
+            fprintf(file, "\"EAPMethod\":\"%s\", ", state->eap_method ? state->eap_method : "null");
+            fprintf(file, "\"OuterTLS\":%s, ", state->outer_tls ? "true" : "false");
+            fprintf(file, "\"FourWayHandshakeObserved\":%s", state->four_way_handshake ? "true" : "false");
+            fprintf(file, "}");
+            is_first_object = false;
+      }
+    }
+    fprintf(file, "\n]\n");
+  }
+  return true;
+}
 
 typedef struct {
   DOT11DECRYPT_KEY_ITEM used_key;
@@ -95,6 +194,7 @@ typedef struct {
 
 bool export_rsn_csv __attribute__((visibility("default")))= false; // use in tshark.c
 bool anonymize_captures __attribute__((visibility("default")))= false; // use in tshark.c
+bool eap_summary_ieee __attribute__((visibility("default")))= false; // use in tshark.c
 
 extern value_string_ext eap_type_vals_ext; /* from packet-eap.c */
 
@@ -30625,10 +30725,33 @@ ieee80211_tag_ssid(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* da
   }
   
   beacon_padding += 1; /* padding bug */
-  if(export_rsn_csv)
+  if(export_rsn_csv || eap_summary_ieee)
   {
     p_add_proto_data(wmem_file_scope(), pinfo, proto_wlan, WLAN_STATS_SSID, wlan_stats.ssid);
-    // printf(" added here ssid key\n");
+    if(eap_summary_ieee){
+      pkt_conversation_setup_helper(pinfo);
+      conversation_t *conv = find_or_create_my_conversation(pinfo );
+
+      printf("creating conversation\n");
+      handshake_state_t *state = (handshake_state_t *)conversation_get_proto_data(conv, proto_eap_additional);
+      if (!state) {
+        wmem_list_append(tracked_convs, conv);
+        // printf("DEBUG: creating state\n");
+        state = wmem_new(wmem_file_scope(), handshake_state_t);
+        char *temp = address_to_str(pinfo->pool,&(pinfo->dl_src));
+        char *client_mac = wmem_alloc(wmem_file_scope(),strlen(temp)+1);
+        memcpy(client_mac,temp,strlen(temp));
+        client_mac[strlen(temp)]='\0';
+
+        char *ssid_store = wmem_alloc0(wmem_file_scope(), MIN(ssid_len, MAX_SSID_LEN));
+        memcpy(ssid_store, wlan_stats.ssid, MIN(ssid_len, MAX_SSID_LEN));
+
+        *state = (handshake_state_t){ssid_store,client_mac,NULL,NULL,false,false,wmem_array_new(wmem_file_scope(), sizeof(nstime_t))};
+        conversation_add_proto_data(conv, proto_eap_additional, state);
+
+      }
+    }
+    // printf("DEBUG: added here ssid key\n");
   }
   return offset + tag_len;
 }
@@ -41942,6 +42065,10 @@ dissect_ieee80211_common(tvbuff_t *tvb, packet_info *pinfo,
 static int
 dissect_ieee80211(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
 {
+  if (!tracked_convs) {
+    tracked_convs = wmem_list_new(wmem_file_scope());
+    wmem_register_callback(wmem_file_scope(), my_cleanup_cb, NULL);
+  }
   struct ieee_802_11_phdr *phdr = (struct ieee_802_11_phdr *)data;
   struct ieee_802_11_phdr ourphdr;
 
@@ -42652,7 +42779,28 @@ dissect_wlan_rsna_eapol_wpa_or_rsn_key(tvbuff_t *tvb, packet_info *pinfo, proto_
         msg_type = DOT11DECRYPT_HS_MSG_TYPE_4WHS_2;
       } else {
         ti = proto_tree_add_uint(tree, hf_wlan_rsna_eapol_wpa_keydes_msgnr, tvb, offset, 0, 4);
+        if(eap_summary_ieee){
+          pkt_conversation_setup_helper(pinfo);
+          conversation_t *conv = find_my_conversation(pinfo);
 
+          if(!conv)
+          {
+            printf("ERROR: Unable to find conversation from beginning for aggregation (5)\n");
+          }
+          else
+          {
+            handshake_state_t *state = (handshake_state_t *)conversation_get_proto_data(conv, proto_eap_additional);
+            if (!state) 
+            {
+              printf("ERROR: Unable to find conversation from beginning for aggregation (6)\n");
+            }
+            else
+            {
+              state->four_way_handshake=true;
+            } 
+          }
+
+        }
         col_set_str(pinfo->cinfo, COL_INFO, "Key (Message 4 of 4)");
         msg_type = DOT11DECRYPT_HS_MSG_TYPE_4WHS_4;
       }
