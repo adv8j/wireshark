@@ -200,9 +200,9 @@ my_cleanup_cb(wmem_allocator_t */*allocator*/, wmem_cb_event_t event, void */*us
 
             printf("  - 4-way handshake was %sseen\n\n",
                   state->four_way_handshake ? "" : "NOT ");
-            fprintf(file, "\n]\n");
       }
     }
+    fprintf(file, "\n]\n");
 
 
 
